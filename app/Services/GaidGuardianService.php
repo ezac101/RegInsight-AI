@@ -36,7 +36,10 @@ class GaidGuardianService
             }
         }
 
-        throw new \RuntimeException('AI service failed to return obligations. Ensure GAID regulation PDF is loaded and Python service is running.');
+        $detail = is_array($response->json()) ? ($response->json('detail') ?? null) : null;
+        $suffix = is_string($detail) && $detail !== '' ? " {$detail}" : '';
+
+        throw new \RuntimeException('AI service failed to return obligations. Ensure GAID regulation PDF is loaded and Python service is running.'.$suffix);
     }
 
     public function analyseGaps(array $payload): array

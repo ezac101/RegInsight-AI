@@ -12,13 +12,33 @@ from groq import Groq
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
-load_dotenv()
+SERVICE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SERVICE_DIR.parent
+
+# Load env files from both service directory and project root so launch cwd does not matter.
+load_dotenv(SERVICE_DIR / '.env')
+load_dotenv(PROJECT_ROOT / '.env')
+
+
+def resolve_env_path(raw_value: str | None, default_path: Path) -> Path:
+    if raw_value is None or raw_value.strip() == '':
+        return default_path
+
+    candidate = Path(raw_value)
+    if candidate.is_absolute():
+        return candidate
+
+    service_relative = (SERVICE_DIR / candidate).resolve()
+    if service_relative.exists():
+        return service_relative
+
+    return (PROJECT_ROOT / candidate).resolve()
 
 app = FastAPI(title='GAID Guardian Service', version='1.0.0')
 
-REGULATION_DEFAULT_PATH = Path(__file__).resolve().parent / 'data' / 'GAID_2025_Regulations.pdf'
-REGULATION_PDF_PATH = Path(os.getenv('GAID_REGULATION_PDF', str(REGULATION_DEFAULT_PATH)))
-CHROMA_DIR = Path(os.getenv('CHROMA_DIR', str(Path(__file__).resolve().parent / 'chroma')))
+REGULATION_DEFAULT_PATH = SERVICE_DIR / 'data' / 'GAID_2025_Regulations.pdf'
+REGULATION_PDF_PATH = resolve_env_path(os.getenv('GAID_REGULATION_PDF'), REGULATION_DEFAULT_PATH)
+CHROMA_DIR = resolve_env_path(os.getenv('CHROMA_DIR'), SERVICE_DIR / 'chroma')
 CHROMA_COLLECTION_NAME = os.getenv('CHROMA_COLLECTION_NAME', 'gaid_2025_clauses')
 
 EMBEDDING_MODEL_NAME = os.getenv('EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2')
@@ -447,11 +467,13 @@ def build_clauses_from_regulation_pdf(path: Path) -> list[dict[str, Any]]:
         return []
 
     clause_pattern = re.compile(r'(GAID\s*2025\s*§\s*\d+(?:\.\d+)*)', flags=re.IGNORECASE)
+    article_pattern = re.compile(r'^Article\s+(\d+[A-Za-z]?)\s*:\s*(.+)$', flags=re.IGNORECASE)
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
 
     extracted: list[dict[str, Any]] = []
     seen_clause_references: set[str] = set()
 
+    # First pass: explicit GAID § references.
     for index, line in enumerate(lines):
         match = clause_pattern.search(line)
         if match is None:
@@ -492,6 +514,82 @@ def build_clauses_from_regulation_pdf(path: Path) -> list[dict[str, Any]]:
 
         if len(extracted) >= 20:
             break
+
+    # Second pass: GAID PDFs often use "Article X" headings instead of § references.
+    if len(extracted) == 0:
+        for index, line in enumerate(lines):
+            article_match = article_pattern.match(line)
+            if article_match is None:
+                continue
+
+            article_number = article_match.group(1).strip()
+            title = article_match.group(2).strip(' -:;')
+            if title == '':
+                title = f'Article {article_number}'
+
+            clause_reference = f'GAID 2025 ARTICLE {article_number}'
+            if clause_reference in seen_clause_references:
+                continue
+
+            detail_parts: list[str] = []
+            for candidate in lines[index + 1:index + 13]:
+                if article_pattern.match(candidate):
+                    break
+                detail_parts.append(candidate)
+
+            description = ' '.join(detail_parts).strip()
+            if description == '':
+                description = f'Refer to Article {article_number} of the GAID 2025 regulation text for full requirement details.'
+
+            category = infer_category(f'{title} {description}')
+
+            extracted.append(
+                {
+                    'clause_reference': clause_reference,
+                    'title': title,
+                    'description': description,
+                    'plain_language': description,
+                    'category': category,
+                    'risk': 'Regulatory sanctions may apply for non-compliance.',
+                }
+            )
+
+            seen_clause_references.add(clause_reference)
+
+            if len(extracted) >= 80:
+                break
+
+    # Last resort: split text into meaningful chunks so retrieval still works.
+    if len(extracted) == 0:
+        paragraph_chunks = [chunk.strip() for chunk in re.split(r'\n\s*\n+', raw_text) if chunk.strip() != '']
+
+        for index, chunk in enumerate(paragraph_chunks):
+            normalized_chunk = re.sub(r'\s+', ' ', chunk).strip()
+            if len(normalized_chunk) < 140:
+                continue
+
+            words = normalized_chunk.split(' ')
+            title = ' '.join(words[:10]).strip(' -:;')
+            if title == '':
+                title = f'Regulatory context block {index + 1}'
+
+            clause_reference = f'GAID 2025 CHUNK {index + 1}'
+            description = normalized_chunk[:1200]
+            category = infer_category(f'{title} {description}')
+
+            extracted.append(
+                {
+                    'clause_reference': clause_reference,
+                    'title': title,
+                    'description': description,
+                    'plain_language': description,
+                    'category': category,
+                    'risk': 'Regulatory sanctions may apply for non-compliance.',
+                }
+            )
+
+            if len(extracted) >= 80:
+                break
 
     return extracted
 
