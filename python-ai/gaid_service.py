@@ -145,7 +145,7 @@ def load_regulation_clauses_on_startup() -> None:
 
     CHROMA_COLLECTION = CHROMA_CLIENT.create_collection(name=CHROMA_COLLECTION_NAME)
 
-    documents = [f"{item['title']}\n{item['description']}" for item in LOADED_CLAUSES]
+    documents = [f"{item.get('title', '')}\n{item.get('description', '')}" for item in LOADED_CLAUSES]
     embeddings = EMBEDDING_MODEL.encode(documents).tolist()
 
     CHROMA_COLLECTION.add(
@@ -449,16 +449,106 @@ def extract_pdf_text(path: str) -> str:
 
     try:
         document = fitz.open(path)
-        text = []
-        for page in document:
-            text.append(page.get_text())
+        text_parts = []
+        for page_num, page in enumerate(document):
+            page_text = page.get_text("text")
+            # Clean common PDF artifacts
+            page_text = re.sub(r'^\s*\d+\s*$', '', page_text, flags=re.MULTILINE)   # lone page numbers
+            page_text = re.sub(r'Page \d+ of \d+', '', page_text, flags=re.IGNORECASE)
+            page_text = re.sub(r'\f', '\n', page_text)  # form feeds
+            text_parts.append(page_text.strip())
         document.close()
-        return '\n'.join(text)
-    except Exception:
+        full_text = '\n\n'.join(filter(None, text_parts))
+        # Final cleanup
+        full_text = re.sub(r'\s+', ' ', full_text).strip()
+        return full_text
+    except Exception as e:
+        print(f"PDF extraction error: {e}")
         return ''
 
 
 def build_clauses_from_regulation_pdf(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        print(f"❌ Regulation PDF not found at {path}")
+        return []
+
+    raw_text = extract_pdf_text(str(path))
+    if raw_text.strip() == '':
+        print("❌ No text extracted from PDF")
+        return []
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+    extracted: list[dict[str, Any]] = []
+    seen_clause_references: set[str] = set()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Stronger Article detection
+        article_match = re.match(r'^Article\s+(\d+[A-Za-z]?)\s*:\s*(.+)$', line, re.IGNORECASE)
+        
+        if article_match:
+            article_number = article_match.group(1).strip()
+            title = article_match.group(2).strip(' -:;')
+            clause_reference = f'GAID 2025 Article {article_number}'
+
+            if clause_reference in seen_clause_references:
+                i += 1
+                continue
+
+            # Collect FULL article content until next Article
+            content_lines: list[str] = [line]  # include header
+            i += 1
+            while i < len(lines):
+                next_line = lines[i]
+                if re.match(r'^Article\s+\d+[A-Za-z]?', next_line, re.IGNORECASE):
+                    break
+                content_lines.append(next_line)
+                i += 1
+
+            description = ' '.join(content_lines).strip()
+            if len(description) < 100:
+                description = title
+
+            category = infer_category(f'{title} {description}')
+
+            extracted.append({
+                'clause_reference': clause_reference,
+                'title': title,
+                'description': description[:1500],      # good size for embeddings
+                'plain_language': description[:1000],
+                'category': category,
+                'risk': 'Regulatory sanctions may apply for non-compliance.',
+            })
+
+            seen_clause_references.add(clause_reference)
+
+            if len(extracted) >= 80:   # plenty for RAG
+                break
+            continue
+
+        i += 1
+
+    # Fallback (safety net)
+    if len(extracted) < 15:
+        print("⚠️ Few articles found — using paragraph fallback")
+        paragraph_chunks = [chunk.strip() for chunk in re.split(r'\n\s*\n+', raw_text) if len(chunk.strip()) > 100]
+        for idx, chunk in enumerate(paragraph_chunks):
+            if len(extracted) >= 80:
+                break
+            cleaned = re.sub(r'\s+', ' ', chunk).strip()
+            extracted.append({
+                'clause_reference': f'GAID 2025 CHUNK {idx + 1}',
+                'title': cleaned[:100],
+                'description': cleaned[:1400],
+                'plain_language': cleaned[:900],
+                'category': infer_category(cleaned),
+                'risk': 'Regulatory sanctions may apply for non-compliance.',
+            })
+
+    print(f"✅ Successfully extracted {len(extracted)} GAID 2025 clauses/articles")
+    return extracted
     if not path.exists():
         return []
 

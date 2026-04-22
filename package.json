@@ -67,6 +67,8 @@
         "vite": "^8.0.0"
     },
     "optionalDependencies": {
+        "@emnapi/core": "1.9.2",
+        "@emnapi/runtime": "1.9.2",
         "@rollup/rollup-linux-x64-gnu": "4.9.5",
         "@rollup/rollup-win32-x64-msvc": "4.9.5",
         "@tailwindcss/oxide-linux-x64-gnu": "^4.0.1",
