@@ -223,83 +223,69 @@ def classify(payload: ClassifyRequest) -> dict[str, Any]:
 @app.post('/get-obligations')
 def get_obligations(payload: ObligationsRequest) -> dict[str, Any]:
     if CHROMA_COLLECTION is None or EMBEDDING_MODEL is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f'GAID regulation PDF not indexed. Upload file to {REGULATION_PDF_PATH} and restart Python service.',
-        )
+        raise HTTPException(status_code=503, detail='GAID regulation PDF not indexed.')
 
     if GROQ_CLIENT is None:
-        raise HTTPException(status_code=503, detail='GROQ_API_KEY is missing. Obligations extraction requires Groq LLM.')
+        raise HTTPException(status_code=503, detail='GROQ_API_KEY is missing.')
 
-    query = (
-        f"sector={payload.sector}; "
-        f"uses_ai={payload.uses_ai}; "
-        f"transfers_data_outside_nigeria={payload.transfers_data_outside_nigeria}; "
-        f"tier={payload.classification.get('tier', 'not_classified')}"
-    )
+    query = f"sector={payload.sector}; uses_ai={payload.uses_ai}; transfers_data_outside_nigeria={payload.transfers_data_outside_nigeria}; tier={payload.classification.get('tier', 'not_classified')}"
 
     query_embedding = EMBEDDING_MODEL.encode([query]).tolist()[0]
     result = CHROMA_COLLECTION.query(query_embeddings=[query_embedding], n_results=8)
-
     metadatas = (result.get('metadatas') or [[]])[0]
 
-    if len(metadatas) == 0:
-        raise HTTPException(status_code=500, detail='No clauses retrieved from ChromaDB.')
+    if not metadatas:
+        raise HTTPException(status_code=500, detail='No clauses retrieved.')
 
-    context_lines = [
-        f"- {item['clause_reference']} | {item['title']} | {item['description']}"
-        for item in metadatas
-    ]
+    context_lines = [f"- {item['clause_reference']} | {item['title']} | {item['description']}" for item in metadatas]
 
+    # STRONGER PROMPT (forces exact keys)
     prompt = (
-        'Using ONLY the text below, list the exact obligations for this organisation. '
-        'Include clause numbers, plain-English explanation, risk, and category. '
-        'Return strict JSON with key obligations (array).\n\n'
-        f"Organisation profile: {query}\n\n"
-        'Regulation context:\n'
-        + '\n'.join(context_lines)
+        'Return ONLY valid JSON. No markdown, no extra text.\n'
+        'Using ONLY the regulation text below, create obligations for this organisation.\n'
+        'Return this exact structure:\n'
+        '{"obligations": [{"clause_reference": "...", "title": "...", "plain_language": "...", "risk": "..."}, ...]}\n\n'
+        f'Organisation profile: {query}\n\n'
+        'Regulation context:\n' + '\n'.join(context_lines)
     )
 
     llm_data = llm_json(prompt)
     raw_obligations = llm_data.get('obligations', [])
 
-    if not isinstance(raw_obligations, list) or len(raw_obligations) == 0:
-        raise HTTPException(status_code=502, detail='Groq returned invalid obligations payload.')
-
     obligations: list[dict[str, Any]] = []
+
     for item in raw_obligations[:8]:
         if not isinstance(item, dict):
             continue
 
-        clause_reference = str(item.get('clause_reference', '')).strip()
-        title = str(item.get('title', '')).strip()
-        description = str(item.get('description', '')).strip()
-        plain_language = str(item.get('plain_language', '')).strip()
-        risk = str(item.get('risk', '')).strip()
+        # More tolerant key mapping
+        clause_reference = str(item.get('clause_reference') or item.get('clause') or '').strip()
+        title = str(item.get('title') or item.get('obligation') or '').strip()
+        plain_language = str(
+            item.get('plain_language') or 
+            item.get('explanation') or 
+            item.get('description') or 
+            item.get('detail') or ''
+        ).strip()
 
         if clause_reference == '' or title == '' or plain_language == '':
             continue
 
-        inferred_category = infer_category(f"{title} {description} {plain_language}")
+        obligations.append({
+            'clause_reference': clause_reference,
+            'title': title,
+            'description': plain_language,
+            'plain_language': plain_language,
+            'deadline': payload.classification.get('filing_deadline'),
+            'risk': str(item.get('risk', 'Regulatory sanctions may apply for non-compliance.')),
+            'category': infer_category(f"{title} {plain_language}"),
+            'mandatory': True,
+        })
 
-        obligations.append(
-            {
-                'clause_reference': clause_reference,
-                'title': title,
-                'description': description if description != '' else plain_language,
-                'plain_language': plain_language,
-                'deadline': payload.classification.get('filing_deadline'),
-                'risk': risk if risk != '' else 'Regulatory sanctions may apply for non-compliance.',
-                'category': inferred_category,
-                'mandatory': True,
-            }
-        )
-
-    if len(obligations) == 0:
-        raise HTTPException(status_code=502, detail='No valid obligations parsed from Groq response.')
+    if not obligations:
+        raise HTTPException(status_code=502, detail='No valid obligations parsed from Groq response. (Check prompt or Groq output)')
 
     return {'obligations': obligations}
-
 
 @app.post('/analyse-gaps')
 def analyse_gaps(payload: GapRequest) -> dict[str, Any]:
@@ -447,26 +433,85 @@ def llm_json(prompt: str) -> dict[str, Any]:
 def extract_pdf_text(path: str) -> str:
     if not Path(path).exists():
         return ''
-
     try:
         document = fitz.open(path)
-        text_parts = []
-        for page_num, page in enumerate(document):
-            page_text = page.get_text("text")
-            # Clean common PDF artifacts
-            page_text = re.sub(r'^\s*\d+\s*$', '', page_text, flags=re.MULTILINE)   # lone page numbers
-            page_text = re.sub(r'Page \d+ of \d+', '', page_text, flags=re.IGNORECASE)
-            page_text = re.sub(r'\f', '\n', page_text)  # form feeds
-            text_parts.append(page_text.strip())
+        full_text = []
+        for page in document:
+            text = page.get_text("text")
+            # Minimal cleaning only
+            text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)   # page numbers
+            text = re.sub(r'Page \d+ of \d+', '', text, flags=re.IGNORECASE)
+            full_text.append(text)
         document.close()
-        full_text = '\n\n'.join(filter(None, text_parts))
-        # Final cleanup
-        full_text = re.sub(r'\s+', ' ', full_text).strip()
-        return full_text
+        return '\n'.join(full_text)
     except Exception as e:
         print(f"PDF extraction error: {e}")
         return ''
 
+
+def build_clauses_from_regulation_pdf(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        print(f"❌ PDF not found: {path}")
+        return []
+
+    raw_text = extract_pdf_text(str(path))
+    if not raw_text.strip():
+        print("❌ No text extracted")
+        return []
+
+    # Stronger regex to catch all Article headings
+    article_pattern = re.compile(
+        r'Article\s+(\d+[A-Za-z]?)\s*[:.-]?\s*(.+?)(?=\s*Article\s+\d+|\Z)',
+        re.IGNORECASE | re.DOTALL
+    )
+
+    extracted: list[dict[str, Any]] = []
+    seen = set()
+
+    for match in article_pattern.finditer(raw_text):
+        article_number = match.group(1).strip()
+        title = match.group(2).strip(' :.-')
+        clause_reference = f'GAID 2025 Article {article_number}'
+
+        if clause_reference in seen:
+            continue
+
+        # Full article content
+        full_article = match.group(0).strip()
+        description = re.sub(r'\s+', ' ', full_article).strip()
+
+        extracted.append({
+            'clause_reference': clause_reference,
+            'title': title or f'Article {article_number}',
+            'description': description[:2000],
+            'plain_language': description[:1400],
+            'category': infer_category(f'{title} {description}'),
+            'risk': 'Regulatory sanctions may apply for non-compliance.',
+        })
+
+        seen.add(clause_reference)
+
+        if len(extracted) >= 120:
+            break
+
+    print(f"✅ Successfully extracted {len(extracted)} GAID 2025 Articles from PDF")
+
+    # Fallback only if very few found
+    if len(extracted) < 15:
+        print("⚠️ Using paragraph fallback as safety net")
+        paragraphs = [p.strip() for p in re.split(r'\n\s*\n+', raw_text) if len(p.strip()) > 80]
+        for idx, para in enumerate(paragraphs[:80]):
+            cleaned = re.sub(r'\s+', ' ', para).strip()
+            extracted.append({
+                'clause_reference': f'GAID 2025 Section {idx + 1}',
+                'title': cleaned[:150],
+                'description': cleaned[:1800],
+                'plain_language': cleaned[:1200],
+                'category': infer_category(cleaned),
+                'risk': 'Regulatory sanctions may apply for non-compliance.',
+            })
+
+    return extracted
 
 def build_clauses_from_regulation_pdf(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
