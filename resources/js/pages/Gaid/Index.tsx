@@ -328,7 +328,7 @@ export default function GaidIndexPage() {
                             Nigerian GAID 2025 Compliance in 7 Guided Steps
                         </h1>
                         <p className="mt-2 text-sm text-slate-600">
-                            Public demo flow for organisations and NDPC regulator visibility. No login required.
+                            Guided flow for organisations with regulator visibility from the NDPC dashboard.
                         </p>
                     </header>
 
