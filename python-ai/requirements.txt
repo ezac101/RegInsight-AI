@@ -1,8 +1,12 @@
 fastapi
-uvicorn
+uvicorn[standard]
 groq
 chromadb
 pymupdf
-sentence-transformers
 reportlab
 python-dotenv
+
+# CRITICAL: CPU-only Torch (prevents huge CUDA download + Railway timeout)
+torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+sentence-transformers
